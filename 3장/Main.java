@@ -1,34 +1,36 @@
 import java.util.*;
 import java.math.BigDecimal;
 
-/**
- * 리팩터링 요약 (5줄)
- * 1) 파싱/검증/가격/할인/배송/재고/저장을 분리하고, Service는 오케스트레이션만 수행.
- * 2) 플래그 인자/출력 인자 제거 → DTO(CheckoutRequest/Receipt)와 예외(Validation/OutOfStock) 사용.
- * 3) 매직 넘버/문자열 제거 → 정책 인터페이스(가격/배송/할인)와 상수로 명시.
- * 4) 부작용 제거 → lastOrderId 같은 숨은 상태 배제, 저장은 Repository로 위임하고 결과로 반환.
- * 5) 한 가지 추상화 레벨 유지 → 상위(서비스 흐름)와 하위(정책/리포지토리)의 관심사 분리.
+/*
+ * [리팩터링 요약]
+ * - checkout 메서드가 너무 많은 일을 하던 구조를 역할별 클래스로 분리함.
+ * - 파싱, 검증, 계산, 할인, 저장, 로그 등 단계별로 책임을 분리.
+ * - boolean vip, List<String> errors 같은 플래그/출력 인자 제거.
+ * - 예외 기반 흐름으로 전환하고 DTO(Request/Receipt) 사용.
+ * - 매직넘버 대신 정책(가격/배송/할인) 클래스로 명시화.
  */
 public class Main {
     public static void main(String[] args) {
-        // 의존성 주입: 정책/서비스/리포지토리 구성
+        // 구성: 정책 / 인벤토리 / 저장소 / 서비스 생성
         PricingPolicy pricing = new PrefixPricingPolicy();
         ShippingPolicy shipping = new KRShippingPolicy();
         DiscountPolicy discount = new CompositeDiscountPolicy(
-                List.of(new VipRateDiscountPolicy(new BigDecimal("0.10")),
-                        new CouponFlatDiscountPolicy("COUPON10", new BigDecimal("10")))
+                List.of(
+                        new VipRateDiscountPolicy(new BigDecimal("0.10")),
+                        new CouponFlatDiscountPolicy("COUPON10", new BigDecimal("10"))
+                )
         );
-        Inventory inventory = new InMemoryInventory(); // 재고 20 이하만 허용 (데모)
+        Inventory inventory = new InMemoryInventory();
         OrderRepository repo = new InMemoryOrderRepository();
 
         RefactoredOrderService svc = new RefactoredOrderService(pricing, shipping, discount, inventory, repo);
 
-        // ===== 1) 정상 케이스 =====
+        // 1) 정상 케이스
         CheckoutRequest ok = new CheckoutRequest("vip001", "A-100", 2, true, "COUPON10");
         Receipt r = svc.checkout(ok);
-        System.out.println("RECEIPT=" + r); // OK:...
+        System.out.println("RECEIPT=" + r);
 
-        // ===== 2) 검증 실패 =====
+        // 2) 검증 실패 케이스
         try {
             svc.checkout(new CheckoutRequest("", "A-100", -1, false, ""));
             System.out.println("FAIL: should have thrown");
@@ -36,7 +38,7 @@ public class Main {
             System.out.println("PASS: " + e.getMessage());
         }
 
-        // ===== 3) 재고 부족 =====
+        // 3) 재고 부족 케이스
         try {
             svc.checkout(new CheckoutRequest("u1", "B-100", 99, false, ""));
             System.out.println("FAIL: should have thrown");
@@ -46,10 +48,9 @@ public class Main {
     }
 }
 
-/* =========================
- * ======  DTO 영역  =======
- * ========================= */
-
+/* -----------------------------
+ * 요청 / 결과 DTO
+ * ----------------------------- */
 final class CheckoutRequest {
     private final String userId;
     private final String itemId;
@@ -87,199 +88,146 @@ final class Receipt {
         this.amount = amount;
     }
 
-    public String orderId() { return orderId; }
-    public String userId() { return userId; }
-    public String itemId() { return itemId; }
-    public int quantity() { return quantity; }
-    public BigDecimal amount() { return amount; }
-
-    @Override public String toString() {
+    @Override
+    public String toString() {
         return "OK:" + orderId + ":" + userId + ":" + itemId + ":" + quantity + ":" + amount;
     }
 }
 
-/* =========================
- * ===== 예외 (도메인) =====
- * ========================= */
-
+/* -----------------------------
+ * 예외 정의
+ * ----------------------------- */
 class ValidationException extends RuntimeException {
-    public ValidationException(String message) { super(message); }
+    public ValidationException(String msg) { super(msg); }
 }
-
 class OutOfStockException extends RuntimeException {
-    public OutOfStockException(String message) { super(message); }
+    public OutOfStockException(String msg) { super(msg); }
 }
 
-/* =========================
- * ===== 검증 전담객체 =====
- * ========================= */
-
+/* -----------------------------
+ * 요청 검증
+ * ----------------------------- */
 final class CheckoutValidator {
     public void validate(CheckoutRequest req) {
         List<String> errors = new ArrayList<>();
         if (isBlank(req.userId())) errors.add("USER_REQUIRED");
         if (isBlank(req.itemId())) errors.add("ITEM_REQUIRED");
         if (req.quantity() <= 0) errors.add("QTY_POSITIVE");
-
         if (!errors.isEmpty()) {
             throw new ValidationException(String.join(", ", errors));
         }
     }
-
     private boolean isBlank(String s) {
         return s == null || s.trim().isEmpty();
     }
 }
 
-/* =========================
- * ====== 정책 인터페이스 ===
- * ========================= */
-
+/* -----------------------------
+ * 정책 인터페이스
+ * ----------------------------- */
 interface PricingPolicy {
     BigDecimal unitPrice(String itemId);
 }
-
 interface ShippingPolicy {
     BigDecimal shippingCost(String itemId, int quantity);
 }
-
 interface DiscountPolicy {
     BigDecimal apply(BigDecimal subtotal, CheckoutRequest req);
 }
 
-/* =========================
- * ===== 정책 구현 (예시) ===
- * ========================= */
-
-/** 아이템ID 접두로 단가 결정: A* → 100, 그 외 → 150 */
+/* -----------------------------
+ * 정책 구현
+ * ----------------------------- */
 final class PrefixPricingPolicy implements PricingPolicy {
-    private static final BigDecimal A_PRICE = new BigDecimal("100");
-    private static final BigDecimal OTHER_PRICE = new BigDecimal("150");
-
-    @Override public BigDecimal unitPrice(String itemId) {
-        if (itemId != null && itemId.startsWith("A")) return A_PRICE;
-        return OTHER_PRICE;
+    @Override
+    public BigDecimal unitPrice(String itemId) {
+        return itemId.startsWith("A") ? new BigDecimal("100") : new BigDecimal("150");
     }
 }
-
-/** KR 배송: A* → 500, 그 외 → 1200 + (무게>10kg이면 800) */
 final class KRShippingPolicy implements ShippingPolicy {
-    private static final BigDecimal A_SHIP = new BigDecimal("500");
-    private static final BigDecimal OTHER_SHIP = new BigDecimal("1200");
-    private static final int WEIGHT_PER_UNIT_KG = 2;
-    private static final int EXTRA_WEIGHT_THRESHOLD = 10;
-    private static final BigDecimal EXTRA_COST = new BigDecimal("800");
-
-    @Override public BigDecimal shippingCost(String itemId, int quantity) {
-        BigDecimal base = (itemId != null && itemId.startsWith("A")) ? A_SHIP : OTHER_SHIP;
-        int weight = WEIGHT_PER_UNIT_KG * Math.max(quantity, 0);
-        BigDecimal extra = weight > EXTRA_WEIGHT_THRESHOLD ? EXTRA_COST : BigDecimal.ZERO;
+    @Override
+    public BigDecimal shippingCost(String itemId, int quantity) {
+        BigDecimal base = itemId.startsWith("A") ? new BigDecimal("500") : new BigDecimal("1200");
+        int weight = 2 * quantity;
+        BigDecimal extra = weight > 10 ? new BigDecimal("800") : BigDecimal.ZERO;
         return base.add(extra);
     }
 }
-
-/** VIP 비율 할인 (예: 10%) */
 final class VipRateDiscountPolicy implements DiscountPolicy {
-    private final BigDecimal rate; // 0.10 = 10%
-
-    public VipRateDiscountPolicy(BigDecimal rate) {
-        this.rate = Objects.requireNonNull(rate);
-    }
-
-    @Override public BigDecimal apply(BigDecimal subtotal, CheckoutRequest req) {
-        if (req.isVip()) {
-            return subtotal.multiply(BigDecimal.ONE.subtract(rate));
-        }
-        return subtotal;
+    private final BigDecimal rate;
+    public VipRateDiscountPolicy(BigDecimal rate) { this.rate = rate; }
+    @Override
+    public BigDecimal apply(BigDecimal subtotal, CheckoutRequest req) {
+        return req.isVip() ? subtotal.multiply(BigDecimal.ONE.subtract(rate)) : subtotal;
     }
 }
-
-/** 쿠폰 고정 차감 (코드 일치 시 10원 차감 등) */
 final class CouponFlatDiscountPolicy implements DiscountPolicy {
     private final String code;
     private final BigDecimal amount;
-
     public CouponFlatDiscountPolicy(String code, BigDecimal amount) {
-        this.code = Objects.requireNonNull(code);
-        this.amount = Objects.requireNonNull(amount);
+        this.code = code; this.amount = amount;
     }
-
-    @Override public BigDecimal apply(BigDecimal subtotal, CheckoutRequest req) {
-        if (req.couponCode() != null && code.equalsIgnoreCase(req.couponCode())) {
-            BigDecimal result = subtotal.subtract(amount);
-            return result.compareTo(BigDecimal.ZERO) < 0 ? BigDecimal.ZERO : result;
+    @Override
+    public BigDecimal apply(BigDecimal subtotal, CheckoutRequest req) {
+        if (code.equalsIgnoreCase(req.couponCode())) {
+            return subtotal.subtract(amount);
         }
         return subtotal;
     }
 }
-
-/** 여러 할인 정책을 순차 적용 */
 final class CompositeDiscountPolicy implements DiscountPolicy {
     private final List<DiscountPolicy> policies;
-
-    public CompositeDiscountPolicy(List<DiscountPolicy> policies) {
-        this.policies = List.copyOf(policies);
-    }
-
-    @Override public BigDecimal apply(BigDecimal subtotal, CheckoutRequest req) {
-        BigDecimal acc = subtotal;
-        for (DiscountPolicy p : policies) acc = p.apply(acc, req);
-        return acc;
+    public CompositeDiscountPolicy(List<DiscountPolicy> policies) { this.policies = policies; }
+    @Override
+    public BigDecimal apply(BigDecimal subtotal, CheckoutRequest req) {
+        BigDecimal result = subtotal;
+        for (DiscountPolicy p : policies) result = p.apply(result, req);
+        return result;
     }
 }
 
-/* =========================
- * ====== 영속/재고 모킹 ===
- * ========================= */
-
+/* -----------------------------
+ * 저장소 / 재고
+ * ----------------------------- */
 interface OrderRepository {
     String save(String userId, String itemId, int qty, BigDecimal amount);
 }
-
 final class InMemoryOrderRepository implements OrderRepository {
-    @Override public String save(String userId, String itemId, int qty, BigDecimal amount) {
+    public String save(String userId, String itemId, int qty, BigDecimal amount) {
         String id = UUID.randomUUID().toString();
-        System.out.println("SAVE: order=" + id + " user=" + userId + " item=" + itemId + " qty=" + qty + " sum=" + amount);
+        System.out.println("SAVE: " + id + " user=" + userId + " item=" + itemId + " qty=" + qty + " sum=" + amount);
         return id;
     }
 }
-
 interface Inventory {
-    /** 요청 수량을 출고할 수 없으면 예외 */
     void ensureAvailable(String itemId, int requestedQty);
 }
-
 final class InMemoryInventory implements Inventory {
-    private static final int MAX_QTY = 20; // 데모용 정책
-    @Override public void ensureAvailable(String itemId, int requestedQty) {
-        if (requestedQty > MAX_QTY) {
-            throw new OutOfStockException("OUT_OF_STOCK");
-        }
+    @Override
+    public void ensureAvailable(String itemId, int requestedQty) {
+        if (requestedQty > 20) throw new OutOfStockException("OUT_OF_STOCK");
     }
 }
 
-/* =========================
- * ======= 도메인 서비스 =====
- * ========================= */
-
+/* -----------------------------
+ * 서비스 (흐름 제어)
+ * ----------------------------- */
 final class RefactoredOrderService {
-    private final PricingPolicy pricingPolicy;
-    private final ShippingPolicy shippingPolicy;
-    private final DiscountPolicy discountPolicy;
+    private final PricingPolicy pricing;
+    private final ShippingPolicy shipping;
+    private final DiscountPolicy discount;
     private final Inventory inventory;
-    private final OrderRepository orderRepository;
+    private final OrderRepository repo;
     private final CheckoutValidator validator = new CheckoutValidator();
 
-    public RefactoredOrderService(PricingPolicy pricingPolicy,
-                                  ShippingPolicy shippingPolicy,
-                                  DiscountPolicy discountPolicy,
-                                  Inventory inventory,
-                                  OrderRepository orderRepository) {
-        this.pricingPolicy = pricingPolicy;
-        this.shippingPolicy = shippingPolicy;
-        this.discountPolicy = discountPolicy;
+    public RefactoredOrderService(PricingPolicy pricing, ShippingPolicy shipping,
+                                  DiscountPolicy discount, Inventory inventory,
+                                  OrderRepository repo) {
+        this.pricing = pricing;
+        this.shipping = shipping;
+        this.discount = discount;
         this.inventory = inventory;
-        this.orderRepository = orderRepository;
+        this.repo = repo;
     }
 
     public Receipt checkout(CheckoutRequest req) {
@@ -287,31 +235,21 @@ final class RefactoredOrderService {
         validator.validate(req);
         inventory.ensureAvailable(req.itemId(), req.quantity());
 
-        BigDecimal itemsCost = pricingPolicy
-                .unitPrice(req.itemId())
-                .multiply(new BigDecimal(req.quantity()));
+        BigDecimal items = pricing.unitPrice(req.itemId()).multiply(new BigDecimal(req.quantity()));
+        BigDecimal shippingCost = shipping.shippingCost(req.itemId(), req.quantity());
+        BigDecimal subtotal = items.add(shippingCost);
+        BigDecimal total = discount.apply(subtotal, req);
 
-        BigDecimal shipCost = shippingPolicy.shippingCost(req.itemId(), req.quantity());
-        BigDecimal subtotal = itemsCost.add(shipCost);
-
-        BigDecimal total = discountPolicy.apply(subtotal, req);
-
-        String orderId = orderRepository.save(req.userId(), req.itemId(), req.quantity(), total);
-
-        Receipt receipt = new Receipt(orderId, req.userId(), req.itemId(), req.quantity(), total);
+        String id = repo.save(req.userId(), req.itemId(), req.quantity(), total);
+        Receipt receipt = new Receipt(id, req.userId(), req.itemId(), req.quantity(), total);
         logEnd(receipt);
         return receipt;
     }
 
     private void logStart(CheckoutRequest req) {
-        System.out.println("[CHECKOUT START] user=" + req.userId()
-                + " item=" + req.itemId()
-                + " qty=" + req.quantity()
-                + " vip=" + req.isVip()
-                + " coupon=" + req.couponCode());
+        System.out.println("[CHECKOUT START] " + req.userId() + "," + req.itemId() + "," + req.quantity());
     }
-
     private void logEnd(Receipt r) {
-        System.out.println("[CHECKOUT END] receipt=" + r);
+        System.out.println("[CHECKOUT END] " + r);
     }
 }
